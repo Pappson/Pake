@@ -1,6 +1,10 @@
 use crate::app::config::PakeConfig;
 use crate::util::get_data_dir;
-use std::{path::PathBuf, str::FromStr, sync::Mutex};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::atomic::{AtomicU32, Ordering},
+};
 use tauri::{
     webview::{NewWindowFeatures, NewWindowResponse},
     AppHandle, Config, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -28,7 +32,7 @@ fn build_proxy_browser_arg(url: &Url) -> Option<String> {
 pub struct MultiWindowState {
     pub pake_config: PakeConfig,
     pub tauri_config: Config,
-    next_window_index: Mutex<u32>,
+    next_window_index: AtomicU32,
 }
 
 impl MultiWindowState {
@@ -36,14 +40,13 @@ impl MultiWindowState {
         Self {
             pake_config,
             tauri_config,
-            next_window_index: Mutex::new(0),
+            next_window_index: AtomicU32::new(0),
         }
     }
 
     fn next_window_label(&self) -> String {
-        let mut index = self.next_window_index.lock().unwrap();
-        *index += 1;
-        format!("pake-{}", *index)
+        let index = self.next_window_index.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("pake-{index}")
     }
 }
 
@@ -79,7 +82,7 @@ fn open_requested_window(
         tauri_config,
         WindowBuildOptions {
             label: &label,
-            url: WebviewUrl::External("about:blank".parse().unwrap()),
+            url: WebviewUrl::External(target_url.clone()),
             visible: true,
             new_window_features: Some(features),
         },
@@ -124,9 +127,25 @@ fn build_window_with_label(
         .first()
         .expect("At least one window configuration is required");
     let url = match window_config.url_type.as_str() {
-        "web" => WebviewUrl::App(window_config.url.parse().unwrap()),
+        "web" => {
+            let parsed = window_config.url.parse().map_err(|err| {
+                tauri::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Invalid 'web' url '{}' in pake.json: {err}",
+                        window_config.url
+                    ),
+                ))
+            })?;
+            WebviewUrl::App(parsed)
+        }
         "local" => WebviewUrl::App(PathBuf::from(&window_config.url)),
-        _ => panic!("url type can only be web or local"),
+        other => {
+            return Err(tauri::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("url_type must be 'web' or 'local', got '{other}'"),
+            )));
+        }
     };
 
     build_window(
@@ -154,7 +173,10 @@ fn build_window(
         visible,
         new_window_features,
     } = opts;
-    let package_name = tauri_config.clone().product_name.unwrap();
+    let package_name = tauri_config
+        .product_name
+        .clone()
+        .unwrap_or_else(|| "pake".to_string());
     let _data_dir = get_data_dir(app, package_name);
 
     let window_config = config
@@ -166,7 +188,7 @@ fn build_window(
 
     let config_script = format!(
         "window.pakeConfig = {}",
-        serde_json::to_string(&window_config).unwrap()
+        serde_json::to_string(&window_config).unwrap_or_else(|_| "{}".to_string())
     );
 
     // Platform-specific title: macOS prefers empty, others fallback to product name
@@ -369,50 +391,29 @@ fn build_window(
     }
 
     if let Some(features) = new_window_features {
-        window_builder = window_builder.window_features(features).focused(true);
+        // macOS popup webviews must reuse the opener webview configuration.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(position) = features.position() {
+                window_builder = window_builder.position(position.x, position.y);
+            }
+
+            if let Some(size) = features.size() {
+                window_builder = window_builder.inner_size(size.width, size.height);
+            }
+
+            window_builder = window_builder
+                .with_webview_configuration(features.opener().target_configuration.clone())
+                .focused(true);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            window_builder = window_builder.window_features(features).focused(true);
+        }
     }
 
-    // Allow navigation to OAuth/authentication domains
-    window_builder = window_builder.on_navigation(|url| {
-        let url_str = url.as_str();
-
-        // Always allow same-origin navigation
-        if url_str.starts_with("http://localhost") || url_str.starts_with("http://127.0.0.1") {
-            return true;
-        }
-
-        // Check for OAuth/authentication domains
-        let auth_patterns = [
-            "accounts.google.com",
-            "login.microsoftonline.com",
-            "github.com/login",
-            "appleid.apple.com",
-            "facebook.com",
-            "twitter.com",
-        ];
-
-        let auth_paths = ["/oauth/", "/auth/", "/authorize", "/login"];
-
-        // Allow if matches auth patterns
-        for pattern in &auth_patterns {
-            if url_str.contains(pattern) {
-                #[cfg(debug_assertions)]
-                println!("Allowing OAuth navigation to: {}", url_str);
-                return true;
-            }
-        }
-
-        for path in &auth_paths {
-            if url_str.contains(path) {
-                #[cfg(debug_assertions)]
-                println!("Allowing auth path navigation to: {}", url_str);
-                return true;
-            }
-        }
-
-        // Allow all other navigation by default
-        true
-    });
+    window_builder = window_builder.on_navigation(|_| true);
 
     window_builder.build()
 }
